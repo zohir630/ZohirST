@@ -1,0 +1,30 @@
+name: Unzip ShizuStore
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip and move files to repo root
+        run: |
+          unzip -q -o *ShizuStore-master.zip -d tmp_unzip
+          # .github বাদ দিয়ে বাকি সব কপি (GitHub নিজের workflow ফাইল push করতে দেয় না)
+          rm -rf tmp_unzip/ShizuStore-master/.github
+          cp -a tmp_unzip/ShizuStore-master/. .
+          rm -rf tmp_unzip *ShizuStore-master.zip
+          ls -la
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Unzip ShizuStore-master.zip"
+          git push
