@@ -1,0 +1,649 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Tim Schneeberger
+ * SPDX-FileCopyrightText: 2026 Aurora OSS
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+package me.timschneeberger.shizustore.viewmodel
+
+import android.content.Context
+import android.net.Uri
+import android.os.Build
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import me.timschneeberger.shizustore.compose.ui.details.composable.canHandleObtainium
+import me.timschneeberger.shizustore.compose.ui.details.composable.obtainiumRepoUrl
+import me.timschneeberger.shizustore.data.api.ApiResult
+import me.timschneeberger.shizustore.data.api.AppHistoryDto
+import me.timschneeberger.shizustore.data.api.Availability
+import me.timschneeberger.shizustore.data.api.ShizuApi
+import me.timschneeberger.shizustore.data.download.ApkSaver
+import me.timschneeberger.shizustore.data.helper.DownloadHelper
+import me.timschneeberger.shizustore.data.helper.InstallDispatcher
+import me.timschneeberger.shizustore.data.model.AppDetails
+import me.timschneeberger.shizustore.data.model.AppSource
+import me.timschneeberger.shizustore.data.model.CertFingerprint
+import me.timschneeberger.shizustore.data.model.DownloadStatus
+import me.timschneeberger.shizustore.data.model.InstallDispatch
+import me.timschneeberger.shizustore.data.model.ResolvedApp
+import me.timschneeberger.shizustore.data.model.preferredForThisDevice
+import me.timschneeberger.shizustore.data.repository.AppRepository
+import me.timschneeberger.shizustore.data.repository.CatalogUiMapper
+import me.timschneeberger.shizustore.data.repository.DetailedAppRepository
+import me.timschneeberger.shizustore.data.repository.DetailedAppResult
+import me.timschneeberger.shizustore.data.repository.FavouriteRepository
+import me.timschneeberger.shizustore.data.repository.IgnoredUpdateRepository
+import me.timschneeberger.shizustore.data.repository.InstalledRepository
+import me.timschneeberger.shizustore.data.repository.LiveReadmeFetcher
+import me.timschneeberger.shizustore.data.room.entity.Download
+import me.timschneeberger.shizustore.data.room.entity.IgnoredUpdateEntity
+import me.timschneeberger.shizustore.data.room.entity.USAGE_REPORT_VERSION
+import me.timschneeberger.shizustore.data.sync.CatalogSyncFailure
+import me.timschneeberger.shizustore.util.PathUtil
+import me.timschneeberger.shizustore.util.Preferences
+
+sealed interface AppDetailsUiState {
+    data object Loading : AppDetailsUiState
+    data object NotFound : AppDetailsUiState
+    data class Error(val failure: CatalogSyncFailure) : AppDetailsUiState
+
+    data class Loaded(
+        val details: AppDetails,
+        val sources: List<AppSource>,
+        /**
+         * The package the entry is actually installed under. An entry is keyed by
+         * its canonical package, but a flavor installs under its own, so system
+         * actions (open, uninstall, app info) must target this, not the key.
+         */
+        val installedPackage: String? = null
+    ) : AppDetailsUiState {
+        /** Resolved once: the getter ran on every read and the source list is fixed. */
+        val resolved: ResolvedApp? = sources.preferredForThisDevice()?.app
+
+        /** The package to act on for installed-app actions, falling back to the catalog key. */
+        val actionablePackage: String get() = installedPackage ?: details.packageName
+    }
+}
+
+/**
+ * One-shot feedback for "Save APK". [Export] means the platform needs the user
+ * to pick a destination (below API 29 there is no permission-free Downloads
+ * write), so the screen opens the SAF picker and calls back into [exportTo].
+ */
+sealed interface SaveApkEvent {
+    data class Export(
+        val packageName: String,
+        val versionCode: Long,
+        val fileName: String
+    ) : SaveApkEvent
+    data object Saved : SaveApkEvent
+    data object Failed : SaveApkEvent
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+@HiltViewModel
+class AppDetailsViewModel @Inject constructor(
+    private val appRepository: AppRepository,
+    private val detailedAppRepository: DetailedAppRepository,
+    private val downloadHelper: DownloadHelper,
+    private val installDispatcher: InstallDispatcher,
+    private val mapper: CatalogUiMapper,
+    private val favouriteRepository: FavouriteRepository,
+    private val ignoredUpdateRepository: IgnoredUpdateRepository,
+    private val installedRepository: InstalledRepository,
+    private val liveReadmeFetcher: LiveReadmeFetcher,
+    private val api: ShizuApi,
+    @param:ApplicationContext private val context: Context
+) : ViewModel() {
+    /** The navigation key: a real package name when known, otherwise the catalog slug. */
+    private val identity = MutableStateFlow<String?>(null)
+    private val slug = MutableStateFlow<String?>(null)
+
+    /** Last detail-fetch failure, surfaced instead of silently showing stale data. */
+    private val _detailError = MutableStateFlow<CatalogSyncFailure?>(null)
+    val detailError: StateFlow<CatalogSyncFailure?> = _detailError.asStateFlow()
+
+    /** User-triggered reload in progress; the pull wrapper keeps feedback visible briefly. */
+    private val _refreshing = MutableStateFlow(false)
+    val refreshing: StateFlow<Boolean> = _refreshing.asStateFlow()
+
+    /** Detail request in progress; only rows that cannot render yet stay blank. */
+    private val _detailFetching = MutableStateFlow(false)
+
+    /** Live README pulled from the forge raw URL; only valid for [liveReadmeSlug]. */
+    private val liveReadme = MutableStateFlow<String?>(null)
+    private val liveReadmeSlug = MutableStateFlow<String?>(null)
+    private var liveReadmeJob: Job? = null
+
+    /** Per-day install/star history for the sparkline; best-effort, null until it lands. */
+    private val _history = MutableStateFlow<AppHistoryDto?>(null)
+    val history: StateFlow<AppHistoryDto?> = _history.asStateFlow()
+    private var historyJob: Job? = null
+
+    /** Exposed so screens can keep their content hidden until the request settles. */
+    val detailFetching: StateFlow<Boolean> = _detailFetching.asStateFlow()
+
+    private val _refusals = Channel<InstallDispatch.Refused>(Channel.BUFFERED)
+    val refusals: Flow<InstallDispatch.Refused> = _refusals.receiveAsFlow()
+
+    private val _saveApk = Channel<SaveApkEvent>(Channel.BUFFERED)
+    val saveApk: Flow<SaveApkEvent> = _saveApk.receiveAsFlow()
+
+    val uiState: StateFlow<AppDetailsUiState> = slug
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { slug -> detailsFor(slug).onStart { emit(AppDetailsUiState.Loading) } }
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
+            AppDetailsUiState.Loading
+        )
+
+    /**
+     * Kept out of [uiState]: the details page must not be recreated for every
+     * download progress tick, only consumers of the download row recompose.
+     */
+    val download: StateFlow<Download?> = slug
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { slug -> observeDownload(slug) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), null)
+
+    val isFavourite: StateFlow<Boolean> = identity
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { favouriteRepository.isFavourite(it) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), false)
+
+    val ignoredUpdate: StateFlow<IgnoredUpdateEntity?> = identity
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { ignoredUpdateRepository.observeIgnore(it) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), null)
+
+    // Other apps by the same stable developer key; empty until a profile is known.
+    // Eager on purpose: the row sits at the bottom of the page, and a query that
+    // only starts once a fling reaches it grows the list and stops the scroll short.
+    val moreFromAuthor: StateFlow<List<ResolvedApp>> = slug
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { currentSlug ->
+            appRepository.observeDetail(currentSlug)
+                .map { it?.app?.authorKey }
+                .distinctUntilChanged()
+                .flatMapLatest { authorKey ->
+                    if (authorKey.isNullOrBlank()) {
+                        flowOf(emptyList())
+                    } else {
+                        appRepository.observeByAuthor(authorKey, currentSlug)
+                            .map { rows -> rows.map(mapper::toResolvedApp) }
+                    }
+                }
+        }
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            emptyList()
+        )
+
+    val categorySlug: StateFlow<String?> = slug
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { currentSlug -> observeCategorySlug(currentSlug) }
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            null
+        )
+
+    /**
+     * Read from the cached catalog row so the action bar does not shift once
+     * the network detail fetch lands; null until a repository URL is known.
+     */
+    val obtainiumUrl: StateFlow<String?> = slug
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { currentSlug -> appRepository.observeDetail(currentSlug) }
+        .map { detailed ->
+            detailed?.app?.let { app ->
+                obtainiumRepoUrl(app.availability, app.sourceUrl, app.url)
+            }
+        }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), null)
+
+    /**
+     * Package queries can be slow on devices with many apps, so the lookup runs
+     * off the main thread; the details screen must never block on it.
+     */
+    val obtainiumInstalled: StateFlow<Boolean> = flow {
+        emit(withContext(Dispatchers.IO) { canHandleObtainium(context) })
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), false)
+
+    /** Catalog preference: when off, the details page hides the tracker card. */
+    val showTrackerInfo: StateFlow<Boolean> = Preferences.booleanFlow(
+        context,
+        Preferences.PREFERENCE_SHOW_TRACKER_INFO,
+        true
+    ).stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), true)
+
+    /** Catalog preference: when off, the details page hides the statistics charts. */
+    val showStatistics: StateFlow<Boolean> = Preferences.booleanFlow(
+        context,
+        Preferences.PREFERENCE_SHOW_STATISTICS,
+        true
+    ).stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), true)
+
+    // Other apps in the same category; empty until a profile is known.
+    // Eager for the same reason as the author row: it is the last item, so it
+    // must be measured before the user can fling down to it.
+    val moreFromCategory: StateFlow<List<ResolvedApp>> = slug
+        .filterNotNull()
+        .distinctUntilChanged()
+        .flatMapLatest { currentSlug ->
+            observeCategorySlug(currentSlug)
+                .flatMapLatest { category ->
+                    if (category.isNullOrBlank()) {
+                        flowOf(emptyList())
+                    } else {
+                        appRepository.observeByCategory(category, currentSlug)
+                            .map { rows -> rows.map(mapper::toResolvedApp) }
+                    }
+                }
+        }
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            emptyList()
+        )
+
+    private fun observeCategorySlug(currentSlug: String) = appRepository.observeDetail(currentSlug)
+        .map { it?.app?.categorySlug }
+        .distinctUntilChanged()
+
+    fun load(packageName: String) {
+        viewModelScope.launch {
+            // A deep link can carry the catalog slug; resolve it to the row's
+            // package first so favourites key off the app, not the argument.
+            val stored = appRepository.getByPackage(packageName) ?: appRepository.get(packageName)
+            identity.value = stored?.packageName ?: packageName
+            val resolvedSlug = stored?.slug ?: packageName
+            _detailFetching.value = true
+            slug.value = resolvedSlug
+            // A view model can be reused for another app; the previous live
+            // README must not leak into the new one.
+            liveReadme.value = null
+            liveReadmeSlug.value = null
+            // Same for the history series, which is fetched per slug below.
+            _history.value = null
+            // The AI usage report lands on a detail fetch and can appear after
+            // the README was cached; refetch once for analyzable apps whose
+            // report is still missing. Apps without a forge repo never have
+            // one, so they keep using the cached detail.
+            val usageMissing = stored != null &&
+                stored.usageShort.isNullOrBlank() &&
+                stored.usageAnalyzedAt.isNullOrBlank() &&
+                (isAnalyzableSource(stored.sourceUrl) || isAnalyzableSource(stored.url))
+            // Cached reports from an older server layout refetch once so the
+            // section headings show up.
+            val usageStale = stored != null &&
+                !stored.usageShort.isNullOrBlank() &&
+                (stored.usageReportVersion ?: 0) < USAGE_REPORT_VERSION
+            if (detailedAppRepository.fullDescription(resolvedSlug).isNullOrBlank() ||
+                usageMissing ||
+                usageStale
+            ) {
+                fetchDetail(resolvedSlug)
+            } else {
+                // A fresh ViewModel (e.g. the full-description screen) already
+                // holding the markdown must not refetch it over the network.
+                _detailFetching.value = false
+            }
+            refreshLiveReadme(resolvedSlug)
+            refreshHistory(resolvedSlug)
+        }
+    }
+
+    /**
+     * Pulls the per-day install/star/release series for the activity charts. Off
+     * the loading path on purpose: the page renders from Room while this
+     * enriches, and a newer load cancels the previous fetch so its data cannot
+     * win.
+     */
+    private fun refreshHistory(resolvedSlug: String) {
+        historyJob?.cancel()
+        historyJob = viewModelScope.launch {
+            // Nothing renders the series while the catalog setting hides it.
+            if (!Preferences.readBoolean(context, Preferences.PREFERENCE_SHOW_STATISTICS, true)) {
+                return@launch
+            }
+            when (val result = api.appHistory(resolvedSlug, HISTORY_DAYS)) {
+                is ApiResult.Success -> if (slug.value == resolvedSlug) {
+                    _history.value = result.value
+                }
+
+                is ApiResult.Failure ->
+                    if (slug.value == resolvedSlug) {
+                        Log.w(TAG, "History fetch failed for $resolvedSlug: ${result.error}")
+                    }
+            }
+        }
+    }
+
+    /**
+     * Pulls the README straight from the forge raw URL so the screen shows the
+     * live file; the stored snapshot covers offline and error cases. A newer
+     * load cancels the previous fetch so its text cannot win.
+     */
+    private fun refreshLiveReadme(resolvedSlug: String) {
+        val url = detailedAppRepository.readmeUrl(resolvedSlug) ?: return
+        liveReadmeJob?.cancel()
+        liveReadmeJob = viewModelScope.launch {
+            val markdown = liveReadmeFetcher.fetch(url)
+            if (!markdown.isNullOrBlank() && slug.value == resolvedSlug) {
+                liveReadmeSlug.value = resolvedSlug
+                liveReadme.value = markdown
+            }
+        }
+    }
+
+    /** Mirrors the server rule: only GitHub and GitLab repos are analyzed. */
+    private fun isAnalyzableSource(url: String?): Boolean {
+        val host = url?.let { runCatching { java.net.URI(it).host }.getOrNull() } ?: return false
+        return host.equals("github.com", ignoreCase = true) ||
+            host.equals("gitlab.com", ignoreCase = true) ||
+            host.endsWith(".github.com", ignoreCase = true) ||
+            host.endsWith(".gitlab.com", ignoreCase = true)
+    }
+
+    fun retry() {
+        val resolvedSlug = slug.value ?: return
+        viewModelScope.launch {
+            _refreshing.value = true
+            try {
+                fetchDetail(resolvedSlug)
+                refreshLiveReadme(resolvedSlug)
+                refreshHistory(resolvedSlug)
+            } finally {
+                _refreshing.value = false
+            }
+        }
+    }
+
+    private suspend fun fetchDetail(resolvedSlug: String) {
+        _detailFetching.value = true
+        try {
+            when (val result = detailedAppRepository.fetchAndPersist(resolvedSlug)) {
+                is DetailedAppResult.Success -> {
+                    // The row can appear from a concurrent catalog sync while the
+                    // fetch is in flight; adopt its package for favourites.
+                    result.app.packageName?.takeIf { it.isNotBlank() }?.let { identity.value = it }
+                    _detailError.value = null
+                }
+                DetailedAppResult.NotFound -> _detailError.value = null
+                is DetailedAppResult.Failed -> {
+                    Log.w(TAG, "Detail fetch failed for $resolvedSlug: ${result.failure}")
+                    _detailError.value = result.failure
+                }
+            }
+        } finally {
+            _detailFetching.value = false
+        }
+    }
+
+    fun toggleFavourite() {
+        val identity = identity.value ?: return
+        viewModelScope.launch { favouriteRepository.toggle(identity) }
+    }
+
+    fun ignoreAllUpdates() {
+        val identity = identity.value ?: return
+        viewModelScope.launch { ignoredUpdateRepository.ignoreAll(identity) }
+    }
+
+    fun ignoreThisVersion() {
+        val app = resolvedApp() ?: return
+        viewModelScope.launch {
+            ignoredUpdateRepository.ignoreVersion(app.packageName)
+        }
+    }
+
+    fun stopIgnoringUpdates() {
+        val identity = identity.value ?: return
+        viewModelScope.launch { ignoredUpdateRepository.stopIgnoring(identity) }
+    }
+
+    fun install() {
+        val loaded = uiState.value as? AppDetailsUiState.Loaded ?: return
+        val source = loaded.sources.firstOrNull { it.installedPackageMatch }
+            ?: loaded.sources.firstOrNull { it.signerMatch }
+            ?: loaded.sources.firstOrNull { it.app.candidateId != null }
+            ?: return
+        val app = source.app
+
+        viewModelScope.launch {
+            val stored = downloadHelper.getDownload(app.packageName)
+
+            if (stored != null &&
+                stored.versionCode == app.versionCode &&
+                installDispatcher.canInstallFromDisk(stored)
+            ) {
+                dispatch(stored)
+                return@launch
+            }
+
+            val entity = appRepository.get(app.slug) ?: return@launch
+            val candidate = app.candidateId?.let { appRepository.candidate(it) } ?: return@launch
+            downloadHelper.enqueueAndInstall(entity, candidate)
+        }
+    }
+
+    fun cancel() {
+        val identity = identity.value ?: return
+        viewModelScope.launch { downloadHelper.cancel(identity) }
+    }
+
+    fun installFrom(source: ResolvedApp) {
+        viewModelScope.launch {
+            val entity = appRepository.get(source.slug) ?: return@launch
+            val candidate = source.candidateId?.let { appRepository.candidate(it) } ?: return@launch
+            downloadHelper.enqueueAndInstall(entity, candidate)
+        }
+    }
+
+    /** Stages the verified APK into the public Downloads folder without installing it. */
+    fun saveApk() {
+        val loaded = uiState.value as? AppDetailsUiState.Loaded ?: return
+        val source = loaded.sources.firstOrNull { it.installedPackageMatch }
+            ?: loaded.sources.firstOrNull { it.signerMatch }
+            ?: loaded.sources.firstOrNull { it.app.candidateId != null }
+            ?: return
+        val app = source.app
+
+        viewModelScope.launch {
+            val stored = downloadHelper.getDownload(app.packageName)
+            if (stored != null &&
+                stored.versionCode == app.versionCode &&
+                downloadHelper.hasApk(stored)
+            ) {
+                emitSaved(stored)
+                return@launch
+            }
+
+            val entity = appRepository.get(app.slug) ?: return@launch
+            val candidate = app.candidateId?.let { appRepository.candidate(it) } ?: return@launch
+            downloadHelper.enqueue(entity, candidate)
+
+            val settled = downloadHelper.downloads
+                .map { rows -> rows.firstOrNull { it.packageName == app.packageName } }
+                .filterNotNull()
+                .first { it.isFinished }
+            if (settled.status == DownloadStatus.COMPLETED && downloadHelper.hasApk(settled)) {
+                emitSaved(settled)
+            } else {
+                _saveApk.send(SaveApkEvent.Failed)
+            }
+        }
+    }
+
+    /** Copies a staged APK into the SAF destination the user picked. */
+    fun exportTo(packageName: String, versionCode: Long, target: Uri) {
+        viewModelScope.launch {
+            val file = PathUtil.getApkFile(context, packageName, versionCode)
+            val copied = withContext(Dispatchers.IO) {
+                runCatching {
+                    val output = context.contentResolver.openOutputStream(target)
+                        ?: return@runCatching false
+                    output.use { stream ->
+                        file.inputStream().use { input -> input.copyTo(stream) }
+                    }
+                    true
+                }.getOrDefault(false)
+            }
+            _saveApk.send(if (copied) SaveApkEvent.Saved else SaveApkEvent.Failed)
+        }
+    }
+
+    private suspend fun emitSaved(download: Download) {
+        val file = PathUtil.getApkFile(context, download.packageName, download.versionCode)
+        val name = ApkSaver.fileName(download.packageName, download.versionCode)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val saved = ApkSaver.saveToDownloads(context, file, name)
+            _saveApk.send(if (saved) SaveApkEvent.Saved else SaveApkEvent.Failed)
+        } else {
+            _saveApk.send(SaveApkEvent.Export(download.packageName, download.versionCode, name))
+        }
+    }
+
+    private suspend fun dispatch(download: Download) {
+        when (val result = installDispatcher.dispatch(download.packageName)) {
+            InstallDispatch.Started -> Unit
+            is InstallDispatch.Refused -> {
+                Log.w(TAG, "Install of ${download.packageName} refused at ${result.status}")
+                _refusals.send(result)
+            }
+        }
+    }
+
+    private fun resolvedApp(): ResolvedApp? = (uiState.value as? AppDetailsUiState.Loaded)?.resolved
+
+    /** The download row is keyed by the flavor package, which is not always
+     * the nav-key package, so match any package the entry ships. */
+    private fun observeDownload(slug: String): Flow<Download?> = combine(
+        appRepository.observeDetail(slug),
+        downloadHelper.downloads
+    ) { detailed, rows ->
+        val identity = identity.value.orEmpty()
+        val packages = buildSet {
+            add(identity)
+            detailed?.app?.packageName?.let { add(it) }
+            detailed?.candidates?.forEach { candidate -> candidate.packageName?.let { add(it) } }
+        }
+        rows.firstOrNull { it.packageName in packages }
+    }.distinctUntilChanged()
+
+    private fun detailsFor(slug: String): Flow<AppDetailsUiState> {
+        val catalog = combine(
+            appRepository.observeDetail(slug),
+            installedRepository.observeAll()
+        ) { detailed, installedAll ->
+            // The entry is keyed by its canonical package, but the user may have
+            // installed a flavor, so match any package the entry ships.
+            val installed = detailed?.let { detail ->
+                val packages = buildSet {
+                    detail.app.packageName?.let { add(it) }
+                    detail.candidates.forEach { candidate ->
+                        candidate.packageName?.let { add(it) }
+                    }
+                }
+                installedAll.firstOrNull { it.packageName == detail.app.packageName }
+                    ?: installedAll.firstOrNull { it.packageName in packages }
+            }
+            detailed to installed
+        }
+
+        return combine(
+            catalog,
+            _detailError,
+            _detailFetching,
+            liveReadmeSlug,
+            liveReadme
+        ) { catalogPair, error, fetching, liveSlug, liveMarkdown ->
+            val (detailed, installed) = catalogPair
+            when {
+                // A summary row lacks the fields the page acts on (url, storeUrl,
+                // permissions, download candidates) until this device has fetched
+                // the detail once, so blank the screen until that request settles;
+                // failures fall back to cached data. Rows fetched before render
+                // immediately while the background fetch only enriches the
+                // README, changelog and screenshot caches.
+                fetching &&
+                    (
+                        detailed == null ||
+                            detailed.app.detailsFetchedAt == null ||
+                            (
+                                detailed.app.availability == Availability.DIRECT_APK &&
+                                    detailed.candidates.isEmpty()
+                                )
+                        ) -> AppDetailsUiState.Loading
+
+                detailed != null -> {
+                    val fingerprint = installed?.let { CertFingerprint.of(it.signer, it.signerMd5) }
+                    // Screenshots, changelog and README URL come straight from the
+                    // row, so a warm reopen renders them on the first emission and
+                    // the background fetch settling changes nothing visible; only
+                    // the live README overrides the stored snapshot.
+                    val details = mapper.toAppDetails(detailed)
+                    val live = liveMarkdown?.takeIf { liveSlug == slug }
+                    AppDetailsUiState.Loaded(
+                        details = live?.let { details.copy(fullDescription = it) } ?: details,
+                        sources = mapper.toSources(detailed, fingerprint, installed?.packageName),
+                        installedPackage = installed?.packageName
+                    )
+                }
+
+                // Nothing cached and the fetch failed: show the failure, not "not found".
+                error != null -> AppDetailsUiState.Error(error)
+
+                else -> AppDetailsUiState.NotFound
+            }
+        }
+            // Building the loaded state parses dates and maps sources; that work
+            // must not sit on the main thread while the details screen composes.
+            .flowOn(Dispatchers.Default)
+    }
+
+    private companion object {
+        const val TAG = "AppDetailsViewModel"
+
+        /** One bounded window backs every chart mode; installs slice a 30-day tail. */
+        const val HISTORY_DAYS = 365
+    }
+}
